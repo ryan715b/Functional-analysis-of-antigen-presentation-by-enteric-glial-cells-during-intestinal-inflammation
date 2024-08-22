@@ -1,0 +1,482 @@
+---
+title: "CD_EGC analysis final"
+author: "Ryan Brown"
+date: "2024-08-21"
+output: html_document
+---
+
+## Load Packages
+```{r Load packages}
+library(dplyr)
+library(Seurat)
+library(cowplot)
+library(patchwork)
+library(ggplot2)
+library(ggthemes)
+library(clusterProfiler)
+library(enrichR)
+library(enrichplot)
+library(grid)
+library(rstatix)
+library(readr)
+library(tidyr)
+library(topGO)
+library(org.Hs.eg.db)
+library(EnhancedVolcano)
+```
+
+# Source data from Kong et. al, 2023: https://doi.org/10.1016/j.immuni.2023.01.002 
+
+```{r Load data and create seurat object}
+# Load data
+CD_Colon_stroma_10X <- Read10X("CD_Colon_10X_data/")
+
+# Create Seurat object using GEX matrices
+CD_Colon_stroma.Seurat <- CreateSeuratObject(counts = CD_Colon_stroma_10X, project = 'CD_Colon_stroma')
+# Explore seurat object metadata
+CD_Colon_stroma.Seurat
+head(colnames(CD_Colon_stroma.Seurat))
+table(CD_Colon_stroma.Seurat$orig.ident)
+head(CD_Colon_stroma.Seurat@meta.data)
+
+# Add Condition column w/ disease state - Healthy vs. Crohn's
+CD_Colon_stroma.Seurat[["Condition"]] <- case_when(
+  startsWith(as.character(CD_Colon_stroma.Seurat$orig.ident), "H") ~ "Healthy",
+  startsWith(as.character(CD_Colon_stroma.Seurat$orig.ident), "N") ~ "Crohn's",
+  startsWith(as.character(CD_Colon_stroma.Seurat$orig.ident), "I") ~ "Crohn's")
+# Check
+CD_Colon_stroma.Seurat[["Condition"]] %>% 
+  slice_sample(n=10)
+
+# Add Subcondition column w/ disease state - Inflamed vs. Noninflamed
+CD_Colon_stroma.Seurat[["Subcondition"]] <- case_when(
+  startsWith(as.character(CD_Colon_stroma.Seurat$orig.ident), "H") ~ "Healthy",
+  startsWith(as.character(CD_Colon_stroma.Seurat$orig.ident), "N") ~ "CD_Noninflamed",
+  startsWith(as.character(CD_Colon_stroma.Seurat$orig.ident), "I") ~ "CD_Inflamed")
+# Check
+CD_Colon_stroma.Seurat[["Subcondition"]] %>% 
+  slice_sample(n=10)
+
+# Change idents to condition
+Idents(CD_Colon_stroma.Seurat) <- "Condition"
+# Check
+head(Idents(CD_Colon_stroma.Seurat))
+# Change order
+CD_Colon_stroma.Seurat$Condition <- factor(CD_Colon_stroma.Seurat$Condition, levels = c("Healthy", "Crohn's"))
+
+# Check
+CD_Colon_stroma.Seurat
+head(colnames(CD_Colon_stroma.Seurat))
+table(CD_Colon_stroma.Seurat$orig.ident)
+head(CD_Colon_stroma.Seurat@meta.data)
+```
+
+```{r Clustering w/ integration}
+
+CD_Colon_stroma.Seurat[["RNA"]]$counts <- as(CD_Colon_stroma.Seurat[["RNA"]]$counts, "CsparseMatrix")
+
+# Normalize, Find Variable Features, Scale, PCA
+CD_Colon_stroma.Seurat <- NormalizeData(CD_Colon_stroma.Seurat)
+CD_Colon_stroma.Seurat <- FindVariableFeatures(CD_Colon_stroma.Seurat, selection.method = "vst", nfeatures = 2000)
+CD_Colon_stroma.Seurat <- ScaleData(CD_Colon_stroma.Seurat)
+CD_Colon_stroma.Seurat <- RunPCA(CD_Colon_stroma.Seurat) 
+
+# Look at UMAP w/out integration
+  # Elbow plot
+ElbowPlot(CD_Colon_stroma.Seurat)
+  # Find Neighbors
+CD_Colon_stroma.Seurat <- FindNeighbors(CD_Colon_stroma.Seurat, dims = 1:7)
+  # Find clusters
+CD_Colon_stroma.Seurat <- FindClusters(CD_Colon_stroma.Seurat, resolution = 0.46)
+  # UMAP
+CD_Colon_stroma.Seurat <- RunUMAP(CD_Colon_stroma.Seurat, dims = 1:7)
+CD_UMAP_grouped_no_integration <- DimPlot(CD_Colon_stroma.Seurat, reduction = "umap", group.by = "Condition")
+CD_UMAP_labeled_no_integration <- DimPlot(CD_Colon_stroma.Seurat, reduction = "umap", label = TRUE)
+plot_grid(CD_UMAP_grouped_no_integration  + labs(title = "UC_10x"), CD_UMAP_labeled_no_integration)
+# View conditions side by side
+DimPlot(CD_Colon_stroma.Seurat, reduction = "umap", split.by = "Condition", label = TRUE) 
+
+# Split by condition
+CD_Colon_stroma.Seurat[["RNA"]] <- split(CD_Colon_stroma.Seurat[["RNA"]], f = CD_Colon_stroma.Seurat$Condition)
+#Check
+CD_Colon_stroma.Seurat
+
+# Integrate
+CD_Seurat.integrated <- IntegrateLayers(object = CD_Colon_stroma.Seurat, method = CCAIntegration, orig.reduction = "pca", new.reduction = "integrated.cca", verbose = F)
+
+# Find Neighbors
+CD_Seurat.integrated <- FindNeighbors(CD_Seurat.integrated, reduction = "integrated.cca", dims = 1:8)
+# Find Clusters 
+CD_Seurat.integrated <- FindClusters(CD_Seurat.integrated, resolution = 0.65, cluster.name = "cca_clusters")
+
+# UMAP
+CD_Seurat.integrated <- RunUMAP(CD_Seurat.integrated, reduction = "integrated.cca", dims = 1:8, reduction.name = "umap.cca")
+CD_UMAP_grouped <- DimPlot(CD_Seurat.integrated, reduction = "umap.cca", group.by = "Condition")
+CD_UMAP_labeled <- DimPlot(CD_Seurat.integrated, reduction = "umap.cca", label = TRUE)
+plot_grid(CD_UMAP_grouped  + labs(title = "UC_10x"), CD_UMAP_labeled)
+# View conditions side by side
+DimPlot(CD_Seurat.integrated, reduction = "umap.cca", split.by = "Condition", label = TRUE) 
+
+```
+
+
+```{r Cluster identification}
+# Fibroblasts
+VlnPlot(CD_Seurat.integrated, features = c("PDGFRA", "CD34","LUM"))
+  # Cluster 0,2,4,5,9,13,17
+
+# Endothelial cells
+VlnPlot(CD_Seurat.integrated, features = c("ICAM1", "CD34"))
+  # Clusters 6,10,14,16
+
+# Lymphatic endothelial cells
+VlnPlot(CD_Seurat.integrated, features = c("LYVE1", "CCL21"))
+  # Cluster 3
+
+# EGCs
+VlnPlot(CD_Seurat.integrated, features = c("PLP1", "S100B"))
+  # Cluster 8
+
+# Myofibroblasts
+VlnPlot(CD_Seurat.integrated, features = c("ACTA2", "DES"))
+  # Cluster 7, 12
+
+# Pericytes
+VlnPlot(CD_Seurat.integrated, features = c("PDGFRB", "NES", "MCAM"))
+  # Cluster 11,15
+
+# Stromal Cycling Cells
+VlnPlot(CD_Seurat.integrated, features = c("HMGB2", "CDC20"))
+  # Cluster 1
+
+
+CD_Seurat_cluster.ids <- c("Fibroblasts 1", "Stromal Cycling Cells", "Fibroblasts 2", "Lymphatic Endothelial Cells", "Fibroblasts 3", "Fibroblasts 4", "Endothelial Cells 1", "Myofibroblasts 1", "Enteric Glial Cells", "Fibroblasts 5", "Endothelial Cells 2", "Pericytes 1", "Myofibroblasts 2", "Fibroblasts 6", "Endothelial Cells 3", "Pericytes 2", "Endothelial Cells 4", "Fibroblasts 7")
+names(CD_Seurat_cluster.ids) <- levels(CD_Seurat.integrated)
+CD_Seurat.integrated <- RenameIdents(CD_Seurat.integrated, CD_Seurat_cluster.ids)
+
+CD_UMAP <- DimPlot(CD_Seurat.integrated, reduction = "umap", label = TRUE, label.box = T, label.size = 8, repel = T, cols = c('Fibroblasts 1' = 'chocolate', 'Stromal Cycling Cells' = 'khaki3', 'Fibroblasts 2' = 'slateblue1', 'Lymphatic Endothelial Cells' = 'orange', 'Fibroblasts 3' = 'red', 'Fibroblasts 4' = 'orchid3', 'Endothelial Cells 1' = 'darkgoldenrod1', 'Myofibroblasts 1' = 'brown2', 'Enteric Glial Cells' = 'lawngreen', 'Fibroblasts 5' = 'olivedrab', 'Endothelial Cells 2' = 'lightseagreen', 'Pericytes 1' = 'yellow2', 'Myofibroblasts 2' = 'deepskyblue2', 'Fibroblasts 6' = 'coral', 'Endothelial Cells 3' = 'firebrick2', 'Pericytes 2' = 'coral3', 'Endothelial Cells 4' = 'darkolivegreen3', 'Fibroblasts 7' = 'skyblue2')) + theme(axis.line = element_line(size = 1), axis.text = element_text(size = 20), axis.title = element_text(size = 20), axis.ticks = element_line(size = 1), axis.ticks.length = unit(.25, "cm")) + xlab("UMAP 1") + ylab("UMAP 2") + NoLegend()
+CD_UMAP
+```
+
+```{r}
+# EGC marker plots
+DefaultAssay(CD_Seurat.integrated) <- "RNA"
+  # Feature plot
+CD_EGCmarker_FeaturePlot <- FeaturePlot(CD_Seurat.integrated, features = c("S100B", "PLP1"), label = T) & theme(axis.line = element_line(size = 1), axis.text = element_text(size = 20), axis.title = element_text(size = 20), axis.ticks = element_line(size = 1), axis.ticks.length = unit(.25, "cm"), plot.title = element_text(face = 'bold.italic', size = 20)) & xlab("UMAP 1") & ylab("UMAP 2") & NoLegend()
+CD_EGCmarker_FeaturePlot
+  # Violin plot
+CD_EGCmarker_Vln <- VlnPlot(CD_Seurat.integrated, features = c("S100B", "PLP1"), cols = c('Fibroblasts 1' = 'chocolate', 'Stromal Cycling Cells' = 'khaki3', 'Fibroblasts 2' = 'slateblue1', 'Lymphatic Endothelial Cells' = 'orange', 'Fibroblasts 3' = 'red', 'Fibroblasts 4' = 'orchid3', 'Endothelial Cells 1' = 'darkgoldenrod1', 'Myofibroblasts 1' = 'brown2', 'Enteric Glial Cells' = 'lawngreen', 'Fibroblasts 5' = 'olivedrab', 'Endothelial Cells 2' = 'lightseagreen', 'Pericytes 1' = 'yellow2', 'Myofibroblasts 2' = 'deepskyblue2', 'Fibroblasts 6' = 'coral', 'Endothelial Cells 3' = 'firebrick2', 'Pericytes 2' = 'coral3', 'Endothelial Cells 4' = 'darkolivegreen3', 'Fibroblasts 7' = 'skyblue2')) & theme(axis.line = element_line(size = 1), axis.text = element_text(size = 20), title = element_text(size = 20), axis.title.y = element_text(size = 20), axis.title.x = element_blank(), axis.ticks.y = element_line(size = 1), axis.ticks.length.y = unit(.25, "cm"), plot.title = element_text(face = 'bold.italic'))
+CD_EGCmarker_Vln
+
+# Fetch S100B/PLP1 expression and cluster # for each cell
+CD_EGCmarker_expression <- FetchData(object = CD_Seurat.integrated, vars = c("S100B","PLP1"), layer = "data")
+CD_EGCmarker_expression$ClusterID <- FetchData(object = CD_Seurat.integrated, vars = "seurat_clusters")
+head(CD_EGCmarker_expression)
+  # Sort by cluster
+CD_EGCmarker_expression <- arrange(CD_EGCmarker_expression, ClusterID)
+
+  # Count # of cells in EGC cluster that are double positive, single positive, double negative.
+EGC_S100B_PLP1_expr <- c((CD_EGCmarker_expression %>% filter(ClusterID == 8) %>% filter(S100B >= 1 & PLP1 >= 1) %>% nrow()), (CD_EGCmarker_expression %>% filter(ClusterID == 8) %>% filter(S100B >= 1 & PLP1 < 1) %>% nrow()), (CD_EGCmarker_expression %>% filter(ClusterID == 8) %>% filter(S100B < 1 & PLP1 >= 1) %>%  nrow()), (CD_EGCmarker_expression %>% filter(ClusterID == 8) %>% filter(S100B < 1 & PLP1 < 1) %>% nrow()))
+  # Count # of cells in all other combined clusters that are double positive, single positive, double negative.
+Othercluster_S100B_PLP1_expr <- c((CD_EGCmarker_expression %>% filter(ClusterID != 8) %>% filter(S100B >= 1 & PLP1 >= 1) %>% nrow()), (CD_EGCmarker_expression %>% filter(ClusterID != 8) %>% filter(S100B >= 1 & PLP1 < 1) %>% nrow()), (CD_EGCmarker_expression %>% filter(ClusterID != 8) %>% filter(S100B < 1 & PLP1 >= 1) %>%  nrow()), (CD_EGCmarker_expression %>% filter(ClusterID != 8) %>% filter(S100B < 1 & PLP1 < 1) %>% nrow()))
+
+# Create vector w/ cluster ID names
+Cluster <- c(rep("EGC cluster", 4), rep("Other clusters", 4))
+# Create vector w/ Expression names
+Expression <- rep(c("S100B+ PLP1+", "S100B+ PLP1-", "S100b- PLP1+", "S100B- PLP1-"), 2)
+# Create vector w/ Cell counts determined above
+CellCount <- c(EGC_S100B_PLP1_expr, Othercluster_S100B_PLP1_expr)
+# Combine into dataframe
+CD_EGCmarker_expression_grouped <- data.frame(Cluster, Expression, CellCount)
+
+# Count total # of cells per group
+p <-  CD_EGCmarker_expression_grouped %>% 
+  group_by(Cluster) %>% 
+  tally(CellCount)
+# Create vector w/ # of cells/group
+Clustersums <- c(rep(p$n[1], 4), rep(p$n[2],4))
+# Add to dataframe
+CD_EGCmarker_expression_grouped$Clustersums <- Clustersums
+
+CD_EGCmarker_expression_grouped <- CD_EGCmarker_expression_grouped %>%  
+  mutate(percent = (CellCount/Clustersums) *100)
+
+CD_EGCmarker_barplots <- ggplot(CD_EGCmarker_expression_grouped, aes(fill = Cluster, x = Cluster, y = percent)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("lawngreen", "lemonchiffon4")) +
+  geom_text(aes(label = signif(percent, 3)), vjust = -0.5) +
+  labs(title = "Crohn's Disease Core EGC marker expression", y = "Percent of cluster", x = "Cluster") +
+  scale_y_continuous(limits = c(0,110), expand = c(0,0)) +
+  scale_x_discrete() +
+  facet_wrap(~factor(Expression, c("S100B+ PLP1+", "S100B+ PLP1-", "S100b- PLP1+", "S100B- PLP1-")), scales = 'free') & 
+  theme_clean() +
+  theme(axis.line = element_line(size = .5), axis.text = element_text(size = 10), title = element_text(size = 20), axis.title.y = element_text(size = 15), axis.title.x = element_blank(), axis.ticks.y = element_line(size = .5), axis.ticks.length.y = unit(.25, "cm"), plot.title = element_text(face = 'bold.italic', size = 20, hjust = .5), strip.text = element_text(size = 14, face = 'bold.italic')) + NoLegend()
+CD_EGCmarker_barplots
+
+## Plot MHC II expression across celltypes
+# Group similar clusters
+CD_Seurat_cluster.ids_grouped <- c("Fibroblasts", "Stromal Cycling Cells", "Fibroblasts", "Lymphatic Endothelial Cells", "Fibroblasts", "Fibroblasts", "Endothelial Cells", "Myofibroblasts", "Enteric Glial Cells", "Fibroblasts", "Endothelial Cells", "Pericytes", "Myofibroblasts", "Fibroblasts", "Endothelial Cells", "Pericytes", "Endothelial Cells", "Fibroblasts")
+names(CD_Seurat_cluster.ids_grouped) <- levels(CD_Seurat.integrated)
+CD_Seurat.integrated_grouped <- RenameIdents(CD_Seurat.integrated, CD_Seurat_cluster.ids_grouped)
+
+# MHC II plots
+  #FeaturePlot
+CD_MHCII_FeaturePlot <- FeaturePlot(CD_Seurat.integrated_grouped, features = "HLA-DRB1", label = T, split.by = "Condition") & theme(axis.line = element_line(size = 1), axis.text = element_text(size = 20), axis.title = element_text(size = 20), axis.ticks = element_line(size = 1), axis.ticks.length = unit(.25, "cm"), plot.title = element_text(face = 'bold', size = 20)) & xlab("UMAP 1") & ylab("UMAP 2") & NoLegend()
+CD_MHCII_FeaturePlot
+  # Violin plot
+MHCIIgenes <- c("HLA-DMA","HLA-DMB","HLA-DOA","HLA-DPA1","HLA-DPB1","HLA-DQA1","HLA-DQA1","HLA-DQB1","HLA-DRA","HLA-DRB1","HLA-DRB5")
+CD_MHCII_Vln <- VlnPlot(CD_Seurat.integrated_grouped, features = MHCIIgenes, split.by = "Condition", cols = c("#232D4B", "#E57200"), stack = T, flip = T) & theme(axis.line = element_line(size = 1), axis.text.x = element_text(size = 15), axis.text.y.left = element_text(size = 12), strip.text.y.right = element_text(size = 20, face = 'bold.italic'), title = element_text(size = 20), axis.title.y = element_text(size = 20), axis.title.x = element_blank(), axis.ticks.y = element_line(size = 1), axis.ticks.length.y = unit(.25, "cm"), plot.title = element_text(face = 'bold.italic')) & NoLegend()
+CD_MHCII_Vln
+```
+
+```{r EGC subcluster}
+# Subset EGCs by cluster and PLP1,S100B expression > 1
+DefaultAssay(CD_Seurat.integrated_grouped) 
+CD_EGCs = subset(CD_Seurat.integrated_grouped, idents = "Enteric Glial Cells")
+CD_EGCs = subset(CD_EGCs, PLP1 >= 1 & S100B >= 1)
+  # Check cell # /sample
+  table(CD_EGCs$Condition)
+  
+JoinLayers(CD_EGCs) 
+
+## Subclustering 
+
+# Normalize, Find Variable Features, Scale, PCA
+CD_EGCs <- NormalizeData(CD_EGCs)
+CD_EGCs <- FindVariableFeatures(CD_EGCs)
+all.genes <- rownames(CD_EGCs)
+CD_EGCs <- ScaleData(CD_EGCs, features = all.genes)
+CD_EGCs <- RunPCA(CD_EGCs)
+
+# Look at UMAP w/out integration
+  # Elbow plot
+ElbowPlot(CD_EGCs)
+  # Find Neighbors
+CD_EGCs <- FindNeighbors(CD_EGCs, dims = 1:5, reduction = "pca")
+  # Find clusters
+CD_EGCs <- FindClusters(CD_EGCs, resolution = 0.5)
+  # UMAP
+CD_EGCs <- RunUMAP(CD_EGCs, dims = 1:5)
+CD_EGCs_UMAP_grouped_no_integration <- DimPlot(CD_EGCs, reduction = "umap", group.by = "Condition")
+CD_EGCs_labeled_no_integration <- DimPlot(CD_EGCs, reduction = "umap", label = TRUE)
+plot_grid(CD_EGCs_UMAP_grouped_no_integration  + labs(title = "CD_EGCs"), CD_EGCs_labeled_no_integration)
+# View conditions side by side
+DimPlot(CD_EGCs, reduction = "umap", split.by = "Condition", label = TRUE) 
+
+# Integrate
+CD_EGCs.integrated <- IntegrateLayers(object = CD_EGCs, method = CCAIntegration, orig.reduction = "pca", new.reduction = "integrated.cca", verbose = F)
+
+# Find Neighbors
+CD_EGCs.integrated <- FindNeighbors(CD_EGCs.integrated, reduction = "integrated.cca", dims = 1:5)
+# Find Clusters 
+CD_EGCs.integrated <- FindClusters(CD_EGCs.integrated, resolution = 0.5, cluster.name = "cca_clusters")
+
+# UMAP
+CD_EGCs.integrated <- RunUMAP(CD_EGCs.integrated, reduction = "integrated.cca", dims = 1:5, reduction.name = "umap.cca")
+CD_EGCs_UMAP_grouped <- DimPlot(CD_EGCs.integrated, reduction = "umap.cca", group.by = "Condition")
+CD_EGCs_UMAP_labeled <- DimPlot(CD_EGCs.integrated, reduction = "umap.cca", label = TRUE)
+plot_grid(CD_EGCs_UMAP_grouped  + labs(title = "CD_10x_EGCs"), CD_EGCs_UMAP_labeled)
+# View conditions side by side
+DimPlot(CD_EGCs.integrated, reduction = "umap.cca", split.by = "Condition", label = TRUE) 
+
+# Vlnplot
+Idents(CD_EGCs) <- "Condition"
+EGC_CD_Vln <- VlnPlot(CD_EGCs, features = c("S100B", "PLP1"), split.by = "Condition", cols = c("#232D4B", "#E57200"), layer = "scale.data") & theme(axis.line = element_line(size = 1), axis.text = element_text(size = 20), title = element_text(size = 20), axis.title.y = element_text(size = 20), axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.y = element_line(size = 1), axis.ticks.length.y = unit(.25, "cm"), axis.ticks.x = element_blank(), plot.title = element_text(face = 'bold.italic'))
+EGC_CD_Vln
+```
+
+
+```{r Differential expression and Gene Ontology}
+# Set RNA default assay, idents to condition
+DefaultAssay(CD_EGCs.integrated) <- "RNA"
+Idents(CD_EGCs.integrated) <- "Condition"
+  # Check
+  Idents(CD_EGCs.integrated)
+  
+  # Join layers
+CD_EGCs.integrated <-JoinLayers(CD_EGCs.integrated)
+# DE testing using findmarkers
+CDvsHC_DE <- FindMarkers(CD_EGCs.integrated, ident.1 = "Crohn's", ident.2 = "Healthy")
+CDvsHC_DE
+
+# Add column for gene symbol
+CDvsHC_DE$genesymbol <- rownames(CDvsHC_DE)
+# Add column for entrez ID
+CDvsHC_DE$entrezID <- mapIds(org.Hs.eg.db, keys = CDvsHC_DE$genes, column = "ENTREZID", keytype = "SYMBOL")
+# Drop rows that don't have mapped entrez gene id (mostly mitochondrial_)
+CDvsHC_DE <- CDvsHC_DE %>% drop_na()
+
+# Volcano plot
+Healthy_Crohns_Volcano <- EnhancedVolcano(CDvsHC_DE, lab = rownames(CDvsHC_DE), x = 'avg_log2FC', y = 'p_val_adj', FCcutoff = 1, labFace = "bold.italic", labSize = 5, legendLabSize = 20, axisLabSize = 20, raster = T, drawConnectors = T, title = NULL, subtitle = NULL, caption = NULL, gridlines.major = F, gridlines.minor = F) & theme(axis.line = element_line(size = 1), axis.text.x = element_text(size = 20), axis.text.y = element_text(size = 20), axis.ticks = element_line(size = 1), axis.ticks.length = unit(.25, "cm"), legend.position = 'top')
+Healthy_Crohns_Volcano
+```
+
+
+````{r}
+## Subset positively DE genes by avg_log2_FC >1 & p_val_adj <.05 and remove NAs
+CD_upregulated <- filter(CDvsHC_DE, avg_log2FC > 1 & p_val_adj < 0.05)
+# Check
+CD_upregulated
+
+# enrichGO
+CD_upregulated_enrichGO <- enrichGO(gene = CD_upregulated$entrezID,
+                            OrgDb = org.Hs.eg.db,
+                            ont = "BP",
+                            pAdjustMethod = "BH",
+                            pvalueCutoff = 0.01,
+                            qvalueCutoff = 0.05,
+                            readable = T)
+CD_upregulated_enrichGO
+head(CD_upregulated_enrichGO)
+
+# Filter to GO level 4
+CD_upregulated_enrichGO <- gofilter(CD_upregulated_enrichGO, level = 4)
+# Simplify repetitice GO terms
+CD_upregulated_enrichGO <- simplify(CD_upregulated_enrichGO, cutoff =0.7, by ="p.adjust", select_fun=min)
+# Bar plot
+barplot(CD_upregulated_enrichGO, showCategory = 10)
+
+mutate(CD_upregulated_enrichGO, qscore = -log(p.adjust, base = 10)) %>% 
+  barplot(x="qscore", showCategory = 5) 
+
+
+# Dot plot
+CD_upregulated_enrichGO_dotplot <- dotplot(CD_upregulated_enrichGO, showCategory = 5)
+CD_upregulated_enrichGO_dotplot <- CD_upregulated_enrichGO_dotplot & theme(rect = element_rect(linewidth = 1, color = 'black'), axis.line = element_line(size = 1), axis.text.y = element_text(size = 14), title = element_text(size = 20), axis.title.y = element_text(size = 20), axis.title.x = element_text(size = 20), axis.text.x = element_text(size = 20), axis.ticks.y = element_line(size = 1), axis.ticks.length.y = unit(.25, "cm"), legend.text = element_text(size = 14)) 
+CD_upregulated_enrichGO_dotplot
+
+# AGPP DE
+AGPP_KEGG_genes <- read.csv("AGPP_genes.csv")
+AGPP_KEGG_vector <- AGPP_KEGG_genes$Gene
+Idents(CD_EGCs.integrated) <- "Condition"
+CD_EGCs_AGPP_KEGG <- subset(CD_EGCs.integrated, features = AGPP_KEGG_vector)
+CD_EGCs_AGPP_KEGG <- ScaleData(CD_EGCs_AGPP_KEGG)
+
+DefaultAssay(CD_EGCs_AGPP_KEGG) <- "RNA"
+
+AGPP_KEGG_Markers <- FindMarkers(CD_EGCs_AGPP_KEGG, ident.1 = "Healthy", ident.2 = "Crohn's")
+AGPP_KEGG_Markers
+AGPP_KEGG_Markers <- subset(AGPP_KEGG_Markers, AGPP_KEGG_Markers$p_val_adj < .05)
+AGPP_KEGG_Markers
+AGPP_KEGG_Markers$gene <- rownames(AGPP_KEGG_Markers)
+AGPP_KEGG_DE_genes <- AGPP_KEGG_Markers$gene
+AGPP_KEGG_DE_genes <- sort(AGPP_KEGG_DE_genes)
+AGPP_KEGG_DE_genes
+AGPP_KEGG_DE_gene_index <- c(1,2,1,1,1,2,2,2,2,2,2,2,2,2,2,1,1,3,3,3,3)
+AGPP_KEGG_DE_genes <- AGPP_KEGG_DE_genes[order(AGPP_KEGG_DE_gene_index)]
+
+DefaultAssay(CD_EGCs.integrated) <- "RNA"
+CD_EGCs.genes <- rownames(CD_EGCs.integrated)
+CD_EGCs.integrated <- ScaleData(CD_EGCs.integrated, features = CD_EGCs.genes)
+
+CD_EGCs.integrated$Condition <- factor(
+CD_EGCs.integrated$Condition,
+levels = c("Healthy", "Crohn's"))
+
+CD_EGC_AGPP_Heatmap <- DoHeatmap(CD_EGCs.integrated, features = AGPP_KEGG_DE_genes, group.by = "Condition", label = F, group.colors = c("#232D4B", "#E57200")) + theme(axis.text.y = element_text(face = "bold.italic", size = 20), legend.text = element_text(size = 20), legend.title = element_text(size = 20)) + guides(color = "none")
+CD_EGC_AGPP_Heatmap
+```
+
+## Repeat w/ Subclutering of S100B+,PLP1- EGCs
+```{r}
+# Subset EGCs by cluster and PLP1,S100B expression > 1
+DefaultAssay(CD_Seurat.integrated) 
+CD_PLPneg_EGCs = subset(CD_Seurat.integrated, idents = "Enteric Glial Cells")
+  # Check cell # /sample
+  table(CD_PLPneg_EGCs$Condition)
+CD_PLPneg_EGCs = subset(CD_PLPneg_EGCs, S100B >= 1 & PLP1 < 1)
+  # Check cell # /sample
+  table(CD_PLPneg_EGCs$Condition)
+  
+# EGC marker violin plot
+Idents(CD_PLPneg_EGCs) <- "Condition"
+CD_PLPneg_EGC_Vln <- VlnPlot(CD_PLPneg_EGCs, features = c("S100B", "PLP1"), split.by = "Condition", cols = c("#232D4B", "#E57200")) & theme(axis.line = element_line(size = 1), axis.text = element_text(size = 20), title = element_text(size = 20), axis.title.y = element_text(size = 20), axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.y = element_line(size = 1), axis.ticks.length.y = unit(.25, "cm"), axis.ticks.x = element_blank(), plot.title = element_text(face = 'bold.italic'))
+CD_PLPneg_EGC_Vln
+
+##Differential Expression testing
+## DE between conditions in all EGC clusters
+# Set RNA default assay, idents to orig.ident
+DefaultAssay(CD_PLPneg_EGCs) <- "RNA"
+Idents(CD_PLPneg_EGCs) <- "Condition"
+# Join layers
+CD_PLPneg_EGCs <-JoinLayers(CD_PLPneg_EGCs)
+# DE testing using findmarkers
+PLPneg_CDvsHC_DE <- FindMarkers(CD_PLPneg_EGCs, ident.1 = "Crohn's", ident.2 = "Healthy")
+PLPneg_CDvsHC_DE
+# Add column for gene symbol
+PLPneg_CDvsHC_DE$genesymbol <- rownames(PLPneg_CDvsHC_DE)
+# Add column for entrez ID
+PLPneg_CDvsHC_DE$entrezID <- mapIds(org.Hs.eg.db, keys = PLPneg_CDvsHC_DE$genes, column = "ENTREZID", keytype = "SYMBOL")
+# Drop rows that don't have mapped entrez gene id (mostly mitochondrial_)
+PLPneg_CDvsHC_DE <- PLPneg_CDvsHC_DE %>% drop_na()
+
+
+# Volcano plot
+PLPneg_CD_EGCs_DE_HvUC_Volcano <- EnhancedVolcano(PLPneg_CDvsHC_DE, lab = rownames(PLPneg_CDvsHC_DE), x = 'avg_log2FC', y = 'p_val_adj', pCutoff = .05, FCcutoff = 1, labFace = "bold.italic", labSize = 5, legendLabSize = 20, axisLabSize = 20, raster = T, drawConnectors = T, title = NULL, subtitle = NULL, caption = NULL, gridlines.major = F, gridlines.minor = F) & theme(axis.line = element_line(size = 1), axis.text.x = element_text(size = 20), axis.text.y = element_text(size = 20), axis.ticks = element_line(size = 1), axis.ticks.length = unit(.25, "cm"), legend.position = 'top')
+PLPneg_CD_EGCs_DE_HvUC_Volcano
+
+
+## Gene Ontology w/ EnrichGO 
+# Subset positively DE genes by avg_log2_FC >1 & p_val_adj <.05 and remove NAs
+PLPneg_CD_upregulated <- filter(PLPneg_CDvsHC_DE, avg_log2FC > 1 & p_val_adj < 0.05)
+# Check
+PLPneg_CD_upregulated
+
+# enrichGO
+PLPneg_CD_upregulated_enrichGO <- enrichGO(gene = PLPneg_CD_upregulated$entrezID,
+                            OrgDb = org.Hs.eg.db,
+                            ont = "BP",
+                            pAdjustMethod = "BH",
+                            pvalueCutoff = 0.01,
+                            qvalueCutoff = 0.05,
+                            readable = T)
+PLPneg_CD_upregulated_enrichGO
+head(PLPneg_CD_upregulated_enrichGO)
+
+# Filter to GO level 4
+PLPneg_CD_upregulated_enrichGO <- gofilter(PLPneg_CD_upregulated_enrichGO, level = 4)
+# Simplify repetitice GO terms
+PLPneg_CD_upregulated_enrichGO <- simplify(PLPneg_CD_upregulated_enrichGO, cutoff =0.7, by ="p.adjust", select_fun=min)
+
+
+# Bar plot
+barplot(PLPneg_CD_upregulated_enrichGO, showCategory = 10)
+
+mutate(PLPneg_CD_upregulated_enrichGO, qscore = -log(p.adjust, base = 10)) %>% 
+  barplot(x="qscore", showCategory = 10) 
+
+
+# Dot plot
+PLPneg_CD_upregulated_enrichGO_dotplot <- dotplot(PLPneg_CD_upregulated_enrichGO, showCategory = 5)
+    PLPneg_CD_upregulated_enrichGO_dotplot <- PLPneg_CD_upregulated_enrichGO_dotplot & theme(rect = element_rect(linewidth = 1, color = 'black'), axis.line = element_line(size = 1), axis.text.y = element_text(size = 14), title = element_text(size = 20), axis.title.y = element_text(size = 20), axis.title.x = element_text(size = 20), axis.text.x = element_text(size = 20), axis.ticks.y = element_line(size = 1), axis.ticks.length.y = unit(.25, "cm"), legend.text = element_text(size = 14)) 
+PLPneg_CD_upregulated_enrichGO_dotplot
+
+
+## Heatmap of DE genes involved in Antigen Processing/Presentation
+#DE genes in KEGG AGPP pathway
+Idents(CD_PLPneg_EGCs) <- "Condition"
+CD_PLPneg_EGCs_AGPP_KEGG <- subset(CD_PLPneg_EGCs, features = AGPP_KEGG_vector)
+CD_PLPneg_EGCs_AGPP_KEGG <- ScaleData(CD_PLPneg_EGCs_AGPP_KEGG)
+
+DefaultAssay(CD_PLPneg_EGCs_AGPP_KEGG) <- "RNA"
+
+CD_PLPneg_EGCs_AGPP_KEGG_Markers <- FindMarkers(CD_PLPneg_EGCs_AGPP_KEGG, ident.1 = "Healthy", ident.2 = "Crohn's")
+CD_PLPneg_EGCs_AGPP_KEGG_Markers
+CD_PLPneg_EGCs_AGPP_KEGG_Markers <- subset(CD_PLPneg_EGCs_AGPP_KEGG_Markers, CD_PLPneg_EGCs_AGPP_KEGG_Markers$p_val_adj < .05)
+CD_PLPneg_EGCs_AGPP_KEGG_Markers
+CD_PLPneg_EGCs_AGPP_KEGG_Markers$gene <- rownames(CD_PLPneg_EGCs_AGPP_KEGG_Markers)
+CD_PLPneg_EGCs_AGPP_KEGG_Markers
+CD_PLPneg_AGPP_KEGG_DE_genes <- CD_PLPneg_EGCs_AGPP_KEGG_Markers$gene
+CD_PLPneg_AGPP_KEGG_DE_genes <- sort(CD_PLPneg_AGPP_KEGG_DE_genes)
+CD_PLPneg_AGPP_KEGG_DE_genes
+CD_PLPnegAGPP_KEGG_DE_gene_index <- c(1,2,1,2,2,2,2,2,2,2,3,3,3,3,1)
+CD_PLPneg_AGPP_KEGG_DE_genes <- CD_PLPneg_AGPP_KEGG_DE_genes[order(CD_PLPnegAGPP_KEGG_DE_gene_index)]
+CD_PLPneg_AGPP_KEGG_DE_genes
+
+DefaultAssay(CD_PLPneg_EGCs) <- "RNA"
+CD_PLPneg_UC_EGCs.genes <- rownames(CD_PLPneg_EGCs)
+CD_PLPneg_EGCs <- ScaleData(CD_PLPneg_EGCs, features = CD_PLPneg_UC_EGCs.genes)
+
+CD_PLPneg_UC_EGC_AGPP_Heatmap <- DoHeatmap(CD_PLPneg_EGCs, features = CD_PLPneg_AGPP_KEGG_DE_genes, group.by = "Condition", label = F, group.colors = c("#232D4B", "#E57200")) + theme(axis.text.y = element_text(face = "bold.italic", size = 20), legend.text = element_text(size = 20), legend.title = element_text(size = 20)) + guides(color = "none")
+CD_PLPneg_UC_EGC_AGPP_Heatmap
+```
